@@ -19,23 +19,24 @@
 //
 // The share fit is blended on the logit scale with two cheaper opinions: a damped trend
 // (a least-squares line of the logit rate against ln(1 + hours since release), read only
-// halfway from the last read to the target, because earn-rate curves bend) and plain
-// persistence (the last read's rate). Weights: share 0.40, trend 0.20, persistence 0.40 —
-// persistence gets a full share of the vote because on rehearsal worlds the fitted
-// curves, left alone, kept overshooting moves that were already mostly spent. The
-// blend's move away from the last rate is capped at 1.4 logit units so no single fit
-// can run away with a trophy.
+// 30% of the way from the last read to the target, because earn-rate curves bend) and
+// plain persistence (the last read's rate). Weights: share 0.20, trend 0.05,
+// persistence 0.75 — persistence carries the vote because on rehearsal worlds the
+// fitted curves, left alone, kept overshooting moves that were already mostly spent.
+// The blend's move away from the last rate is capped at 0.8 logit units so no single
+// fit can run away with a trophy.
 //
 // The spread is per trophy: a base that widens with the horizon, scaled by the trophy's
 // own trend-fit residual (a trophy whose logit rate has been jumpy gets a wider band),
-// plus a small step allowance when the recorded rates take many distinct values
+// plus a small step allowance when the recorded rates take a few distinct values
 // (Exophase refreshes in steps, and a step between the checkpoint and the target is the
-// main risk a narrow band misses). It is floored at 0.45 and capped at 1.05 logit
+// main risk a narrow band misses). It is floored at 0.45 and capped at 2.05 logit
 // units. The widths were set on rehearsal worlds built like this contest's data
 // (saturating player growth, per-trophy penetration curves, step refreshes, a weekend
-// surge): there, bands much wider than this paid at every quantile, and bands much
-// narrower are the ones the launch-night refresh punished — 0.45 is the floor that
-// keeps one unseen refresh inside the 90% band for a typical trophy.
+// surge), then re-tuned in a second round over five world families with held-out
+// worlds the tuning never saw: the wider bands and the heavier persistence weight
+// held up on the held-out worlds, the narrower first-round bands did not — a band
+// that one unseen refresh can jump clean over is the expensive mistake here.
 //
 // Assumptions, stated plainly:
 //  - Exophase refreshes its counts in steps, so the recorded reads are step functions of
@@ -86,7 +87,7 @@ const invLogit = (l: number): number => 100 / (1 + Math.exp(-l));
 const round4 = (x: number): number => Math.round(x * 10_000) / 10_000;
 
 /** Median earn rate (percent) assumed for a trophy with no earners yet, by tier. */
-const TIER_PRIOR: Record<string, number> = { platinum: 0.04, gold: 0.25, silver: 0.6, bronze: 1.2 };
+const TIER_PRIOR: Record<string, number> = { platinum: 0.15, gold: 0.1, silver: 0.6, bronze: 1.2 };
 
 /**
  * Fit v(t) = V - A * exp(-a * (t - t0)) to (ts, vs) by least squares over a fixed grid
@@ -125,7 +126,7 @@ function fitSaturating(ts: number[], vs: number[]): ((t: number) => number) | nu
 
 /**
  * Damped trend opinion for one trophy: least-squares line of logit(rate) on
- * x = ln(1 + hours since release), evaluated halfway from the last read's x to
+ * x = ln(1 + hours since release), evaluated 30% of the way from the last read's x to
  * the target's x. Returns { level, residSd } in logit units, or null when fewer than
  * three usable reads (rates strictly inside (0, 100)) exist.
  */
@@ -142,7 +143,7 @@ function dampedTrend(xs: number[], ys: number[], xEval: number): { level: number
   const b0 = my - b1 * mx;
   let sse = 0;
   for (let k = 0; k < n; k++) { const r = ys[k] - (b0 + b1 * xs[k]); sse += r * r; }
-  const residSd = Math.max(0.15, Math.sqrt(sse / Math.max(1, n - 2)));
+  const residSd = Math.max(0.05, Math.sqrt(sse / Math.max(1, n - 2)));
   return { level: b0 + b1 * xEval, residSd };
 }
 
@@ -157,7 +158,7 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
   const tTargetH = tTargetMs / 3_600_000;
   const xOf = (ms: number): number => Math.log(1 + Math.max(0, (ms - releaseMs) / 3_600_000));
   const xLast = xOf(tLastMs);
-  const xEval = xLast + 0.5 * (xOf(tTargetMs) - xLast);
+  const xEval = xLast + 0.3 * (xOf(tTargetMs) - xLast);
 
   return c.trophies.map((t, i) => {
     // This trophy's observed series, oldest first: times, rates, trend points.
@@ -185,7 +186,7 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
     let sigmaBase: number;
     if (lastRate === null || earners <= 0) {
       median = TIER_PRIOR[t.tier] ?? 0.5;
-      sigmaBase = 0.25; // an unobserved trophy could land almost anywhere low
+      sigmaBase = 0.45; // an unobserved trophy could land almost anywhere low
     } else {
       // Share fit: saturating exponential on the printed rates themselves.
       const sFit = fitSaturating(ts, shares);
@@ -193,18 +194,18 @@ function forecastCase(c: Case): Array<{ id: number; q: number[] }> {
       shareTarget = Math.min(99.5, Math.max(0.01, shareTarget));
       // Blend the three opinions on the logit scale, cap the move from the last rate.
       const anchor = logit(lastRate);
-      let m = 0.4 * logit(shareTarget) + 0.4 * anchor;
-      m += trend ? 0.2 * trend.level : 0.2 * anchor;
-      m = Math.min(Math.max(m, anchor - 1.4), anchor + 1.4);
+      let m = 0.2 * logit(shareTarget) + 0.75 * anchor;
+      m += trend ? 0.05 * trend.level : 0.05 * anchor;
+      m = Math.min(Math.max(m, anchor - 0.8), anchor + 0.8);
       median = invLogit(m);
-      sigmaBase = 0.06 + 0.16 * (trend ? trend.residSd : 0.3);
+      sigmaBase = 0.02 + 0.3 * (trend ? trend.residSd : 0.3);
     }
 
     // Spread: horizon growth, the trophy's own jumpiness, and a step allowance when the
     // recorded rates take many distinct values (refresh steps are the tail risk).
     const distinct = new Set(shares.map((s) => Math.round(s * 100) / 100)).size;
-    const jumpy = distinct >= 6 ? 0.06 : distinct >= 3 ? 0.03 : 0;
-    const sigma = Math.min(1.05, Math.max(0.45, 0.22 + sigmaBase * (0.45 + Math.sqrt(days)) + jumpy));
+    const jumpy = distinct >= 3 && distinct < 6 ? 0.06 : 0;
+    const sigma = Math.min(2.05, Math.max(0.45, 1.45 * (0.22 + sigmaBase * (0.6 + 1.15 * Math.sqrt(days))) + jumpy));
     const m = logit(median);
     return { id: t.id, q: Z.map((z) => round4(invLogit(m + z * sigma))) };
   });
